@@ -4,8 +4,8 @@ from supabase import create_client
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("https://qlidfgyxgudykqlvltav.supabase.co")
-SUPABASE_KEY = os.getenv("sb_publishable_w58lPsTZfb0VPeQeipIezw_sWpSMqPL")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL:
     raise ValueError("SUPABASE_URL is missing from .env")
@@ -19,6 +19,7 @@ supabase = create_client(
 )
 
 print("Supabase connection initialized successfully")
+
 response = supabase.table("predictions").select("*").limit(1).execute()
 
 print("Database connection works")
