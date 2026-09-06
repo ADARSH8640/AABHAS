@@ -1,0 +1,60 @@
+# Git backup
+.git_backup/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Node.js
+node_modules/
+frontend/node_modules/
+
+# Build files
+dist/
+dist-ssr/
+build/
+
+# Datasets
+dataset/
+dataset.zip
+test_images/
+
+# Large ML model files
+*.pt
+*.pth
+*.h5
+*.onnx
+*.pkl
+*.joblib
+
+# Runtime drone data
+drone_ingestion/incoming/
+drone_ingestion/explainability/
+
+# Logs / temporary files
+*.log
+*.tmp
+*.temp
+
+# Test / generated files
+gradcam_download.png
+test_download.jpeg
+test_download.jpegcurl.exe
+interrupt_test.py
+notepad test_server.py
+test_server.py
+upload_test.py
+uvicorn_diagnostic.py
+uvicorn_nosignal.py
+uvicorn_test.py
+
+# OS files
+.DS_Store
+Thumbs.db
