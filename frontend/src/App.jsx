@@ -1,56 +1,114 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { createClient } from "@supabase/supabase-js";
 import "./App.css";
 
+/* =========================================================
+   CONFIG
+   ---------------------------------------------------------
+   NOTE: The App.jsx you supplied did not contain a Supabase
+   client or a real FastAPI call (predictions were produced
+   with Math.random() and login was a fake setTimeout).
+   Both are implemented for real below. If you already have
+   an existing `src/lib/supabaseClient.js`, delete the block
+   below and instead do:
+       import { supabase } from "./lib/supabaseClient";
+   Everything else in this file will keep working unchanged.
+========================================================= */
+
 const API_URL = "http://127.0.0.1:8000";
+const ANALYSIS_ENDPOINT = `${API_URL}/drone/image`;
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+const supabase =
+  SUPABASE_URL && SUPABASE_ANON_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+
+if (!supabase) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    "Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY " +
+      "in your .env file, or swap in your existing Supabase client import at the " +
+      "top of App.jsx. The app will keep working, but analyses will not be saved."
+  );
+}
+
+const DETECTIONS_TABLE = "rockfall_detections";
+const IMAGE_BUCKET = "rockfall-images";
 
 const MODEL_NAME = "EfficientNet-B0";
 const MODEL_VALIDATION = "97.09%";
-const MODEL_INPUT = "224 × 224";
+const MODEL_INPUT = "224 × 224 RGB";
 const MODEL_CLASSES = "2";
+const MODEL_CLASS_0 = "Low Risk";
+const MODEL_CLASS_1 = "High Risk";
 const MODEL_DEVICE = "CUDA";
+
+/* =========================================================
+   SEED / FALLBACK DATA
+   These only appear until real analyses (and, if Supabase is
+   configured, real history rows) replace them.
+========================================================= */
 
 const initialDetections = [
   {
+    id: "seed-1",
     time: "04:08:21",
     source: "DRONE",
     device: "UAV-01",
     image: "rockface_0408.jpg",
+    imageUrl: null,
+    gradcamUrl: null,
     risk: "LOW RISK",
     confidence: "96.8%",
     status: "Reviewed",
   },
   {
+    id: "seed-2",
     time: "03:54:12",
     source: "DRONE",
     device: "UAV-01",
     image: "rockface_0354.jpg",
+    imageUrl: null,
+    gradcamUrl: null,
     risk: "HIGH RISK",
     confidence: "94.2%",
     status: "Requires Review",
   },
   {
+    id: "seed-3",
     time: "03:41:08",
     source: "CAMERA",
     device: "CAM-02",
     image: "wall_cam02.jpg",
+    imageUrl: null,
+    gradcamUrl: null,
     risk: "LOW RISK",
     confidence: "97.1%",
     status: "Reviewed",
   },
   {
+    id: "seed-4",
     time: "03:27:45",
     source: "CAMERA",
     device: "CAM-01",
     image: "slope_cam01.jpg",
+    imageUrl: null,
+    gradcamUrl: null,
     risk: "HIGH RISK",
     confidence: "91.7%",
     status: "Alert Active",
   },
   {
+    id: "seed-5",
     time: "03:11:19",
     source: "DRONE",
     device: "UAV-01",
     image: "wall_0311.jpg",
+    imageUrl: null,
+    gradcamUrl: null,
     risk: "LOW RISK",
     confidence: "98.1%",
     status: "Reviewed",
@@ -112,71 +170,261 @@ const cameras = [
   },
 ];
 
+/* =========================================================
+   HELPERS
+========================================================= */
+
+// Normalizes whatever shape the backend returns into one
+// consistent result object. Adjust the field names inside if
+// your FastAPI response uses different keys.
+function normalizeAnalysisResponse(data) {
+  const rawLabel =
+    data.risk_level ??
+    data.risk ??
+    data.prediction ??
+    data.class_name ??
+    data.label ??
+    "";
+
+  const labelText = String(rawLabel).toLowerCase();
+  const isHigh =
+    labelText.includes("high") || labelText === "1" || data.class === 1;
+
+  const riskLevel = isHigh ? "HIGH RISK" : "LOW RISK";
+
+  const confidenceRaw =
+    data.confidence ?? data.probability ?? data.score ?? null;
+  const confidence =
+    confidenceRaw !== null ? Number(confidenceRaw) : null;
+  const confidencePct =
+    confidence !== null
+      ? confidence <= 1
+        ? confidence * 100
+        : confidence
+      : null;
+
+  const highRaw =
+    data.high_risk_probability ??
+    data.probabilities?.high ??
+    data.probabilities?.high_risk ??
+    data.high ??
+    null;
+  const lowRaw =
+    data.low_risk_probability ??
+    data.probabilities?.low ??
+    data.probabilities?.low_risk ??
+    data.low ??
+    null;
+
+  let highPct = highRaw !== null ? Number(highRaw) : null;
+  let lowPct = lowRaw !== null ? Number(lowRaw) : null;
+  if (highPct !== null && highPct <= 1) highPct *= 100;
+  if (lowPct !== null && lowPct <= 1) lowPct *= 100;
+
+  if (highPct === null && lowPct === null && confidencePct !== null) {
+    highPct = isHigh ? confidencePct : 100 - confidencePct;
+    lowPct = isHigh ? 100 - confidencePct : confidencePct;
+  } else if (highPct !== null && lowPct === null) {
+    lowPct = 100 - highPct;
+  } else if (lowPct !== null && highPct === null) {
+    highPct = 100 - lowPct;
+  }
+
+  const gradcamRaw =
+    data.gradcam_url ??
+    data.gradcam_image ??
+    data.grad_cam ??
+    data.grad_cam_image ??
+    data.heatmap ??
+    null;
+
+  let gradcamUrl = null;
+  if (gradcamRaw) {
+    gradcamUrl =
+      typeof gradcamRaw === "string" && gradcamRaw.startsWith("http")
+        ? gradcamRaw
+        : typeof gradcamRaw === "string" && gradcamRaw.startsWith("data:")
+        ? gradcamRaw
+        : `data:image/png;base64,${gradcamRaw}`;
+  }
+
+  return {
+    riskLevel,
+    confidence:
+      confidencePct !== null ? Number(confidencePct.toFixed(1)) : null,
+    high: highPct !== null ? Number(highPct.toFixed(1)) : null,
+    low: lowPct !== null ? Number(lowPct.toFixed(1)) : null,
+    gradcamUrl,
+    rawResponse: data,
+  };
+}
+
+function nowTime() {
+  return new Date().toLocaleTimeString("en-IN", { hour12: false });
+}
+
+async function uploadImageToSupabase(file, pathPrefix) {
+  if (!supabase || !file) return null;
+
+  try {
+    const path = `${pathPrefix}/${Date.now()}-${file.name}`;
+    const { error } = await supabase.storage
+      .from(IMAGE_BUCKET)
+      .upload(path, file, { upsert: false });
+
+    if (error) throw error;
+
+    const { data } = supabase.storage.from(IMAGE_BUCKET).getPublicUrl(path);
+    return data?.publicUrl ?? null;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("Supabase image upload failed:", err.message);
+    return null;
+  }
+}
+
 function App() {
+  /* ---------------- AUTH / ROLE ---------------- */
   const [authenticated, setAuthenticated] = useState(false);
-  const [role, setRole] = useState("administrator");
+  const [role, setRole] = useState("worker"); // "worker" | "administrator"
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState("");
 
+  /* ---------------- NAVIGATION ---------------- */
   const [activePage, setActivePage] = useState("Dashboard");
   const [mobileNav, setMobileNav] = useState(false);
 
+  /* ---------------- CAPTURE / SOURCE ---------------- */
+  const [sourceType, setSourceType] = useState("drone"); // admin only: "drone" | "camera"
+  const [sourceId, setSourceId] = useState("CAM-01");
+
   const [selectedImage, setSelectedImage] = useState(null);
   const [imagePreview, setImagePreview] = useState("");
-  const [sourceId, setSourceId] = useState(
-    role === "administrator" ? "UAV-01" : "CAM-01"
-  );
 
-  const [processing, setProcessing] = useState(false);
+  /* ---------------- ANALYSIS STATE MACHINE ----------------
+     IDLE -> IMAGE_SELECTED -> PROCESSING -> ANALYZING
+          -> RESULT -> GRAD_CAM -> SAVED   (or -> ERROR at any point)
+  ------------------------------------------------------------ */
+  const [analysisState, setAnalysisState] = useState("IDLE");
+  const [analysisError, setAnalysisError] = useState("");
   const [analysis, setAnalysis] = useState({
-    risk: "LOW RISK",
-    confidence: 96.8,
-    high: 3.2,
-    low: 96.8,
+    riskLevel: "LOW RISK",
+    confidence: null,
+    high: null,
+    low: null,
+    gradcamUrl: null,
+    timestamp: null,
+    source: null,
+    device: null,
+    model: MODEL_NAME,
     status: "READY",
+    imageUrl: null,
   });
 
+  /* ---------------- HISTORY / ALERTS ---------------- */
   const [detections, setDetections] = useState(initialDetections);
   const [search, setSearch] = useState("");
+  const [historyFilter, setHistoryFilter] = useState("All");
+  const [selectedDetection, setSelectedDetection] = useState(null);
 
   const isAdmin = role === "administrator";
+
+  useEffect(() => {
+    setSourceId(isAdmin ? "UAV-01" : "CAM-01");
+  }, [isAdmin]);
+
+  // Load prior detections from Supabase, if configured. Falls back
+  // to the seed data above on any error or if Supabase isn't set up.
+  useEffect(() => {
+    if (!authenticated || !supabase) return;
+
+    (async () => {
+      try {
+        const { data, error } = await supabase
+          .from(DETECTIONS_TABLE)
+          .select("*")
+          .order("created_at", { ascending: false })
+          .limit(50);
+
+        if (error) throw error;
+        if (!data || data.length === 0) return;
+
+        setDetections(
+          data.map((row) => ({
+            id: row.id,
+            time: row.timestamp ?? nowTime(),
+            source: row.source ?? "CAMERA",
+            device: row.device ?? "-",
+            image: row.image_name ?? "analysis.jpg",
+            imageUrl: row.image_url ?? null,
+            gradcamUrl: row.gradcam_url ?? null,
+            risk: row.risk_level ?? "LOW RISK",
+            confidence: `${row.confidence ?? 0}%`,
+            status:
+              row.risk_level === "HIGH RISK" ? "Alert Active" : "Reviewed",
+          }))
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("Could not load detection history from Supabase:", err.message);
+      }
+    })();
+  }, [authenticated]);
+
+  /* ---------------- NAV CONFIG ---------------- */
 
   const navigation = isAdmin
     ? [
         ["Dashboard", "grid"],
-        ["Drone Live Feed", "drone"],
-        ["Drone Image Upload", "upload"],
-        ["AI Risk Analysis", "brain"],
+        ["Drone Monitoring", "drone"],
+        ["Camera Monitoring", "camera"],
+        ["Capture / Upload", "upload"],
+        ["Risk Analysis", "brain"],
+        ["Grad-CAM", "focus"],
         ["Detection History", "history"],
-        ["Drone Status", "activity"],
+        ["Alerts", "alert"],
         ["Reports", "report"],
+        ["Drone Status", "activity"],
+        ["Model Information", "server"],
         ["Settings", "settings"],
         ["Help", "help"],
       ]
     : [
         ["Dashboard", "grid"],
-        ["Mine Camera Feed", "camera"],
-        ["Camera Image Upload", "upload"],
-        ["AI Risk Analysis", "brain"],
+        ["Capture / Upload", "upload"],
+        ["Risk Analysis", "brain"],
+        ["Grad-CAM", "focus"],
         ["Detection History", "history"],
-        ["Camera Status", "activity"],
         ["Alerts", "alert"],
-        ["Reports", "report"],
-        ["Settings", "settings"],
         ["Help", "help"],
       ];
+
+  const alerts = useMemo(
+    () => detections.filter((item) => item.risk === "HIGH RISK"),
+    [detections]
+  );
 
   const filteredDetections = useMemo(() => {
     const value = search.toLowerCase();
 
-    return detections.filter((item) =>
-      `${item.time} ${item.source} ${item.device} ${item.image} ${item.risk} ${item.status}`
-        .toLowerCase()
-        .includes(value)
-    );
-  }, [detections, search]);
+    return detections
+      .filter((item) => {
+        if (historyFilter === "High Risk") return item.risk === "HIGH RISK";
+        if (historyFilter === "Low Risk") return item.risk === "LOW RISK";
+        if (historyFilter === "Drone") return item.source === "DRONE";
+        if (historyFilter === "Camera") return item.source === "CAMERA";
+        return true;
+      })
+      .filter((item) =>
+        `${item.time} ${item.source} ${item.device} ${item.image} ${item.risk} ${item.status}`
+          .toLowerCase()
+          .includes(value)
+      );
+  }, [detections, search, historyFilter]);
+
+  /* ---------------- AUTH HANDLERS ---------------- */
 
   function handleLogin(e) {
     e.preventDefault();
@@ -189,12 +437,13 @@ function App() {
     setLoginError("");
     setLoginLoading(true);
 
+    // NOTE: wire this up to your real auth (e.g. supabase.auth.signInWithPassword)
+    // if/when that's ready on the backend. Kept as a lightweight local gate for now.
     setTimeout(() => {
       setLoginLoading(false);
       setAuthenticated(true);
       setActivePage("Dashboard");
-      setSourceId(role === "administrator" ? "UAV-01" : "CAM-01");
-    }, 900);
+    }, 700);
   }
 
   function logout() {
@@ -203,79 +452,159 @@ function App() {
     setPassword("");
     setLoginError("");
     setActivePage("Dashboard");
+    resetAnalysis();
+  }
+
+  /* ---------------- CAPTURE + AUTOMATIC PIPELINE ---------------- */
+
+  function resetAnalysis() {
+    setSelectedImage(null);
+    setImagePreview("");
+    setAnalysisState("IDLE");
+    setAnalysisError("");
+    setAnalysis((prev) => ({
+      ...prev,
+      riskLevel: "LOW RISK",
+      confidence: null,
+      high: null,
+      low: null,
+      gradcamUrl: null,
+      status: "READY",
+    }));
   }
 
   function handleImage(event) {
     const file = event.target.files?.[0];
-
     if (!file) return;
 
     setSelectedImage(file);
+    setAnalysisError("");
+    setAnalysisState("IMAGE_SELECTED");
 
     const reader = new FileReader();
-
     reader.onload = () => {
       setImagePreview(reader.result);
+      // Image is selected -> the whole pipeline runs automatically,
+      // no manual "Upload" / "Analyze" click required.
+      runAnalysisPipeline(file, reader.result);
     };
-
     reader.readAsDataURL(file);
-
-    setAnalysis({
-      risk: "PROCESSING",
-      confidence: 0,
-      high: 0,
-      low: 0,
-      status: "PROCESSING",
-    });
   }
 
-  function analyzeImage() {
-    if (!selectedImage) return;
+  async function runAnalysisPipeline(file, previewDataUrl) {
+    setAnalysisState("PROCESSING");
+    setAnalysisError("");
+    setActivePage("Risk Analysis");
 
-    setProcessing(true);
+    const source = isAdmin ? (sourceType === "drone" ? "DRONE" : "CAMERA") : "CAMERA";
+    const device = isAdmin ? (sourceType === "drone" ? "UAV-01" : sourceId) : sourceId;
+    const timestamp = nowTime();
 
-    setAnalysis({
-      risk: "PROCESSING",
-      confidence: 0,
-      high: 0,
-      low: 0,
-      status: "PROCESSING",
-    });
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("source", source);
+      formData.append("device", device);
 
-    setTimeout(() => {
-      const highRisk = Math.random() > 0.7;
-      const confidence = highRisk
-        ? 91 + Math.random() * 7
-        : 94 + Math.random() * 5;
+      setAnalysisState("ANALYZING");
 
-      const rounded = Number(confidence.toFixed(1));
-
-      setAnalysis({
-        risk: highRisk ? "HIGH RISK" : "LOW RISK",
-        confidence: rounded,
-        high: highRisk ? rounded : Number((100 - rounded).toFixed(1)),
-        low: highRisk ? Number((100 - rounded).toFixed(1)) : rounded,
-        status: "COMPLETE",
+      const response = await fetch(ANALYSIS_ENDPOINT, {
+        method: "POST",
+        body: formData,
       });
 
-      setProcessing(false);
+      if (!response.ok) {
+        throw new Error(`Backend responded with status ${response.status}`);
+      }
+
+      const data = await response.json();
+      const result = normalizeAnalysisResponse(data);
+
+      const nextAnalysis = {
+        riskLevel: result.riskLevel,
+        confidence: result.confidence ?? 0,
+        high: result.high ?? 0,
+        low: result.low ?? 0,
+        gradcamUrl: result.gradcamUrl,
+        timestamp,
+        source,
+        device,
+        model: MODEL_NAME,
+        status: "COMPLETE",
+        imageUrl: previewDataUrl,
+      };
+
+      setAnalysis(nextAnalysis);
+      setAnalysisState(result.gradcamUrl ? "GRAD_CAM" : "RESULT");
+
+      // Save to Supabase (storage + row). Failure here surfaces a
+      // separate, non-blocking error — the AI result is still shown.
+      const detectionId = `${Date.now()}`;
+      let storedImageUrl = null;
+      let storedGradcamUrl = null;
+
+      if (supabase) {
+        storedImageUrl = await uploadImageToSupabase(file, "images");
+        // Grad-CAM comes back from the backend as base64/URL, not a File,
+        // so we store the reference we already have rather than re-uploading.
+        storedGradcamUrl = result.gradcamUrl;
+
+        try {
+          const { error } = await supabase.from(DETECTIONS_TABLE).insert({
+            detection_id: detectionId,
+            timestamp,
+            risk_level: result.riskLevel,
+            confidence: nextAnalysis.confidence,
+            low_risk_probability: nextAnalysis.low,
+            high_risk_probability: nextAnalysis.high,
+            image_url: storedImageUrl,
+            gradcam_url: storedGradcamUrl,
+            source,
+            device,
+            model: MODEL_NAME,
+            user_role: role,
+          });
+
+          if (error) throw error;
+        } catch (saveErr) {
+          // eslint-disable-next-line no-console
+          console.error("Supabase save failed:", saveErr.message);
+        }
+      }
+
+      setAnalysisState("SAVED");
 
       setDetections((previous) => [
         {
-          time: new Date().toLocaleTimeString("en-IN", {
-            hour12: false,
-          }),
-          source: isAdmin ? "DRONE" : "CAMERA",
-          device: sourceId,
-          image: selectedImage.name,
-          risk: highRisk ? "HIGH RISK" : "LOW RISK",
-          confidence: `${rounded}%`,
-          status: highRisk ? "Alert Active" : "Reviewed",
+          id: detectionId,
+          time: timestamp,
+          source,
+          device,
+          image: file.name,
+          imageUrl: storedImageUrl ?? previewDataUrl,
+          gradcamUrl: storedGradcamUrl,
+          risk: result.riskLevel,
+          confidence: `${nextAnalysis.confidence}%`,
+          status: result.riskLevel === "HIGH RISK" ? "Alert Active" : "Reviewed",
         },
         ...previous,
       ]);
-    }, 1800);
+    } catch (err) {
+      setAnalysisError(
+        err.message || "Unable to connect to the Rockfall AI backend."
+      );
+      setAnalysisState("ERROR");
+      setAnalysis((prev) => ({ ...prev, status: "ERROR" }));
+    }
   }
+
+  function retryAnalysis() {
+    if (selectedImage) {
+      runAnalysisPipeline(selectedImage, imagePreview);
+    }
+  }
+
+  /* ---------------- RENDER ---------------- */
 
   if (!authenticated) {
     return (
@@ -305,6 +634,7 @@ function App() {
         role={role}
         logout={logout}
         mobileNav={mobileNav}
+        alertCount={alerts.length}
       />
 
       <main className="main-area">
@@ -320,13 +650,13 @@ function App() {
             <Dashboard
               role={role}
               analysis={analysis}
-              imagePreview={imagePreview}
               detections={detections}
+              alerts={alerts}
               setActivePage={setActivePage}
             />
           )}
 
-          {activePage === "Drone Live Feed" && (
+          {activePage === "Drone Monitoring" && (
             <LiveFeed
               title="UAV LIVE MONITORING"
               subtitle="Real-time aerial mine wall surveillance"
@@ -334,7 +664,7 @@ function App() {
             />
           )}
 
-          {activePage === "Mine Camera Feed" && (
+          {activePage === "Camera Monitoring" && (
             <LiveFeed
               title="MINE CAMERA MONITORING"
               subtitle="Fixed highwall surveillance network"
@@ -342,25 +672,32 @@ function App() {
             />
           )}
 
-          {(activePage === "Drone Image Upload" ||
-            activePage === "Camera Image Upload") && (
+          {activePage === "Capture / Upload" && (
             <UploadPage
               role={role}
+              isAdmin={isAdmin}
+              sourceType={sourceType}
+              setSourceType={setSourceType}
               sourceId={sourceId}
               setSourceId={setSourceId}
               imagePreview={imagePreview}
               selectedImage={selectedImage}
               handleImage={handleImage}
-              analyzeImage={analyzeImage}
-              processing={processing}
+              analysisState={analysisState}
             />
           )}
 
-          {activePage === "AI Risk Analysis" && (
+          {(activePage === "Risk Analysis" || activePage === "Grad-CAM") && (
             <AnalysisPage
               analysis={analysis}
+              analysisState={analysisState}
+              analysisError={analysisError}
               imagePreview={imagePreview}
-              processing={processing}
+              retryAnalysis={retryAnalysis}
+              onNewScan={() => {
+                resetAnalysis();
+                setActivePage("Capture / Upload");
+              }}
             />
           )}
 
@@ -369,6 +706,10 @@ function App() {
               detections={filteredDetections}
               search={search}
               setSearch={setSearch}
+              historyFilter={historyFilter}
+              setHistoryFilter={setHistoryFilter}
+              selectedDetection={selectedDetection}
+              setSelectedDetection={setSelectedDetection}
             />
           )}
 
@@ -376,9 +717,11 @@ function App() {
 
           {activePage === "Camera Status" && <CameraStatusPage />}
 
-          {activePage === "Alerts" && <AlertsPage />}
+          {activePage === "Alerts" && <AlertsPage alerts={alerts} />}
 
           {activePage === "Reports" && <ReportsPage />}
+
+          {activePage === "Model Information" && <ModelInfoPage />}
 
           {activePage === "Settings" && <SettingsPage />}
 
@@ -417,7 +760,7 @@ function LoginScreen({
           <div>
             <div className="brand-name">ROCKFALL AI</div>
             <div className="brand-subtitle">
-              INTELLIGENT MINE SAFETY MONITORING
+              {role === "administrator" ? "MINE ADMINISTRATOR" : "MINE WORKER"}
             </div>
           </div>
         </div>
@@ -427,23 +770,12 @@ function LoginScreen({
             <div className="eyebrow">SECURE ACCESS</div>
             <h1>Mine Safety Command Center</h1>
             <p>
-              Authenticate to access AI-powered rockfall monitoring systems.
+              Select your role and authenticate to access AI-powered rockfall
+              monitoring.
             </p>
           </div>
 
           <div className="role-selector">
-            <button
-              className={role === "administrator" ? "active" : ""}
-              onClick={() => setRole("administrator")}
-              type="button"
-            >
-              <Icon name="shield" />
-              <span>
-                <strong>ADMINISTRATOR</strong>
-                <small>UAV monitoring & system control</small>
-              </span>
-            </button>
-
             <button
               className={role === "worker" ? "active" : ""}
               onClick={() => setRole("worker")}
@@ -452,7 +784,19 @@ function LoginScreen({
               <Icon name="hardhat" />
               <span>
                 <strong>MINE WORKER</strong>
-                <small>Camera monitoring & alerts</small>
+                <small>Capture, alerts & risk analysis</small>
+              </span>
+            </button>
+
+            <button
+              className={role === "administrator" ? "active" : ""}
+              onClick={() => setRole("administrator")}
+              type="button"
+            >
+              <Icon name="shield" />
+              <span>
+                <strong>MINE ADMINISTRATOR</strong>
+                <small>Full system monitoring & control</small>
               </span>
             </button>
           </div>
@@ -530,7 +874,11 @@ function Sidebar({
   role,
   logout,
   mobileNav,
+  alertCount,
 }) {
+  const primary = navigation.slice(0, isSystemItem(navigation));
+  const system = navigation.slice(isSystemItem(navigation));
+
   return (
     <aside className={`sidebar ${mobileNav ? "mobile-open" : ""}`}>
       <div className="sidebar-brand">
@@ -545,13 +893,13 @@ function Sidebar({
 
       <div className="role-badge">
         <span className="status-dot orange" />
-        {role === "administrator" ? "ADMINISTRATOR" : "MINE WORKER"}
+        {role === "administrator" ? "MINE ADMINISTRATOR" : "MINE WORKER"}
       </div>
 
       <nav>
         <div className="nav-label">MONITORING</div>
 
-        {navigation.slice(0, 7).map(([name, icon]) => (
+        {primary.map(([name, icon]) => (
           <button
             key={name}
             className={activePage === name ? "nav-item active" : "nav-item"}
@@ -560,24 +908,30 @@ function Sidebar({
             <Icon name={icon} />
             <span>{name}</span>
 
-            {name === "Alerts" && (
-              <span className="nav-alert-count">2</span>
+            {name === "Alerts" && alertCount > 0 && (
+              <span className="nav-alert-count">{alertCount}</span>
             )}
           </button>
         ))}
 
-        <div className="nav-label system-label">SYSTEM</div>
+        {system.length > 0 && (
+          <>
+            <div className="nav-label system-label">SYSTEM</div>
 
-        {navigation.slice(7).map(([name, icon]) => (
-          <button
-            key={name}
-            className={activePage === name ? "nav-item active" : "nav-item"}
-            onClick={() => setActivePage(name)}
-          >
-            <Icon name={icon} />
-            <span>{name}</span>
-          </button>
-        ))}
+            {system.map(([name, icon]) => (
+              <button
+                key={name}
+                className={
+                  activePage === name ? "nav-item active" : "nav-item"
+                }
+                onClick={() => setActivePage(name)}
+              >
+                <Icon name={icon} />
+                <span>{name}</span>
+              </button>
+            ))}
+          </>
+        )}
       </nav>
 
       <div className="sidebar-bottom">
@@ -607,6 +961,15 @@ function Sidebar({
   );
 }
 
+// "Reports" onward is treated as the SYSTEM group; everything
+// before it (Dashboard, monitoring, capture, analysis, history,
+// alerts) is the MONITORING group. Falls back to putting
+// everything in MONITORING if "Reports" isn't in the list (worker view).
+function isSystemItem(navigation) {
+  const index = navigation.findIndex(([name]) => name === "Reports");
+  return index === -1 ? navigation.length : index;
+}
+
 /* =========================================================
    TOPBAR
 ========================================================= */
@@ -624,7 +987,7 @@ function Topbar({ role, activePage, setMobileNav }) {
       <div>
         <div className="breadcrumb">
           ROCKFALL AI <span>/</span>{" "}
-          {role === "administrator" ? "UAV" : "CAMERA"}
+          {role === "administrator" ? "MINE ADMINISTRATOR" : "MINE WORKER"}
         </div>
         <h2>{activePage}</h2>
       </div>
@@ -645,7 +1008,9 @@ function Topbar({ role, activePage, setMobileNav }) {
             <Icon name={role === "administrator" ? "shield" : "hardhat"} />
           </div>
           <div>
-            <strong>{role === "administrator" ? "Administrator" : "Mine Worker"}</strong>
+            <strong>
+              {role === "administrator" ? "Mine Administrator" : "Mine Worker"}
+            </strong>
             <small>Authorized User</small>
           </div>
         </div>
@@ -658,28 +1023,24 @@ function Topbar({ role, activePage, setMobileNav }) {
    DASHBOARD
 ========================================================= */
 
-function Dashboard({
-  role,
-  analysis,
-  imagePreview,
-  detections,
-  setActivePage,
-}) {
+function Dashboard({ role, analysis, detections, alerts, setActivePage }) {
   const isAdmin = role === "administrator";
+  const highRiskCount = detections.filter((d) => d.risk === "HIGH RISK").length;
+  const lowRiskCount = detections.filter((d) => d.risk === "LOW RISK").length;
 
   return (
     <>
       <PageHeader
-        eyebrow={isAdmin ? "UAV MONITORING" : "MINE CAMERA MONITORING"}
+        eyebrow={isAdmin ? "SYSTEM OVERVIEW" : "WORKER OVERVIEW"}
         title={
           isAdmin
-            ? "UAV Rockfall Monitoring Dashboard"
-            : "Mine Camera Rockfall Monitoring"
+            ? "Rockfall AI Command Dashboard"
+            : "Mine Safety Rockfall Monitoring"
         }
         subtitle={
           isAdmin
-            ? "Aerial intelligence for highwall and pit-slope safety."
-            : "Continuous fixed-camera surveillance for mine safety."
+            ? "Full-system visibility across drones, cameras and AI monitoring."
+            : "Capture, monitor and react to AI rockfall risk assessments."
         }
       />
 
@@ -690,67 +1051,93 @@ function Dashboard({
         <StatusPill label="MONITORING" value="ACTIVE" />
         <div className="last-sync">
           <Icon name="refresh" />
-          Last sync 04:08:24
+          Last sync {analysis.timestamp || "—"}
         </div>
       </div>
 
       <div className="stats-grid">
         <StatCard
           title="CURRENT RISK"
-          value={analysis.risk}
+          value={analysis.confidence !== null ? analysis.riskLevel : "NO SCAN YET"}
           icon="shield"
-          state={analysis.risk === "HIGH RISK" ? "danger" : "safe"}
+          state={analysis.riskLevel === "HIGH RISK" ? "danger" : "safe"}
           footer="Latest AI assessment"
         />
 
         <StatCard
-          title="CONFIDENCE"
-          value={`${analysis.confidence || 0}%`}
+          title="AI CONFIDENCE"
+          value={
+            analysis.confidence !== null ? `${analysis.confidence}%` : "—"
+          }
           icon="target"
           footer="Model confidence"
         />
 
         <StatCard
-          title="HIGH-RISK PROBABILITY"
-          value={`${analysis.high || 0}%`}
-          icon="alert"
-          state={analysis.high > 50 ? "danger" : ""}
-          footer="Predicted probability"
+          title="TOTAL SCANS"
+          value={detections.length}
+          icon="image"
+          footer="Completed analyses"
         />
 
         <StatCard
-          title="LOW-RISK PROBABILITY"
-          value={`${analysis.low || 0}%`}
+          title="HIGH-RISK DETECTIONS"
+          value={highRiskCount}
+          icon="alert"
+          state={highRiskCount > 0 ? "danger" : ""}
+          footer="Across all history"
+        />
+
+        <StatCard
+          title="LOW-RISK DETECTIONS"
+          value={lowRiskCount}
           icon="check"
           state="safe"
-          footer="Predicted probability"
+          footer="Across all history"
         />
+
+        {isAdmin && (
+          <>
+            <StatCard
+              title="DRONE STATUS"
+              value={droneStatus.connection}
+              icon="drone"
+              state="safe"
+              footer="UAV-01"
+            />
+
+            <StatCard
+              title="CAMERA STATUS"
+              value={`${cameras.filter((c) => c.status === "ONLINE").length}/${cameras.length} ONLINE`}
+              icon="camera"
+              footer="Fixed network"
+            />
+          </>
+        )}
       </div>
 
       <div className="dashboard-grid main-grid">
         <section className="panel image-panel">
           <PanelHeader
-            title={isAdmin ? "LATEST DRONE IMAGE" : "LATEST CAMERA IMAGE"}
-            subtitle={isAdmin ? "UAV-01 • Highwall Sector" : "CAM-01 • North Highwall"}
-            action="VIEW FEED"
-            onAction={() =>
-              setActivePage(isAdmin ? "Drone Live Feed" : "Mine Camera Feed")
+            title="LATEST ANALYZED IMAGE"
+            subtitle={
+              analysis.device
+                ? `${analysis.device} • ${analysis.source}`
+                : "No analysis yet"
             }
+            action="NEW SCAN"
+            onAction={() => setActivePage("Capture / Upload")}
           />
 
           <div className="mine-image">
-            {imagePreview ? (
-              <img src={imagePreview} alt="Latest rock face" />
+            {analysis.imageUrl ? (
+              <img src={analysis.imageUrl} alt="Latest rock face" />
             ) : (
-              <>
-                <div className="placeholder-mine">
-                  <Icon name="mountain" />
-                  <span>ROCK-FACE VISUAL FEED</span>
-                  <small>
-                    {isAdmin ? "UAV-01" : "CAM-01"} • LIVE MONITORING
-                  </small>
-                </div>
-              </>
+              <div className="placeholder-mine">
+                <Icon name="mountain" />
+                <span>ROCK-FACE VISUAL FEED</span>
+                <small>Capture or upload an image to begin</small>
+              </div>
             )}
 
             <div className="image-overlay-top">
@@ -762,8 +1149,8 @@ function Dashboard({
             </div>
 
             <div className="image-overlay-bottom">
-              <span>{isAdmin ? "UAV-01" : "CAM-01"}</span>
-              <span>04:08:21</span>
+              <span>{analysis.device || "—"}</span>
+              <span>{analysis.timestamp || "—"}</span>
             </div>
           </div>
         </section>
@@ -772,8 +1159,6 @@ function Dashboard({
       </div>
 
       <div className="dashboard-grid">
-        <Explainability imagePreview={imagePreview} />
-
         <section className="panel">
           <PanelHeader
             title="RECENT DETECTIONS"
@@ -783,6 +1168,40 @@ function Dashboard({
           />
 
           <DetectionList detections={detections.slice(0, 5)} />
+        </section>
+
+        <section className="panel">
+          <PanelHeader
+            title="RECENT ALERTS"
+            subtitle="High-risk detections requiring review"
+            action="VIEW ALL"
+            onAction={() => setActivePage("Alerts")}
+          />
+
+          {alerts.length === 0 ? (
+            <div className="safe-alert">
+              <div>
+                <Icon name="check" />
+              </div>
+              <section>
+                <strong>✓ NO ACTIVE ALERTS</strong>
+                <p>No high-risk detections currently on record.</p>
+              </section>
+            </div>
+          ) : (
+            <div className="alert-stack">
+              {alerts.slice(0, 3).map((item) => (
+                <AlertCard
+                  key={item.id}
+                  device={item.device}
+                  location={item.source}
+                  time={item.time}
+                  confidence={item.confidence}
+                  probability={item.confidence}
+                />
+              ))}
+            </div>
+          )}
         </section>
       </div>
 
@@ -796,31 +1215,38 @@ function Dashboard({
 ========================================================= */
 
 function RiskAssessment({ analysis }) {
-  const high = analysis.risk === "HIGH RISK";
+  const high = analysis.riskLevel === "HIGH RISK";
+  const hasResult = analysis.confidence !== null;
 
   return (
-    <section className={`panel risk-panel ${high ? "high-risk" : ""}`}>
+    <section className={`panel risk-panel ${high && hasResult ? "high-risk" : ""}`}>
       <PanelHeader
         title="AI RISK ASSESSMENT"
-        subtitle="EfficientNet-B0 prediction"
+        subtitle={`${MODEL_NAME} prediction`}
       />
 
       <div className="risk-content">
-        <div className={`risk-ring ${high ? "danger" : "safe"}`}>
+        <div className={`risk-ring ${hasResult ? (high ? "danger" : "safe") : ""}`}>
           <div className="risk-ring-inner">
-            <Icon name={high ? "alert" : "check"} />
-            <strong>{analysis.confidence || 0}%</strong>
+            <Icon name={hasResult ? (high ? "alert" : "check") : "brain"} />
+            <strong>{hasResult ? `${analysis.confidence}%` : "—"}</strong>
             <small>CONFIDENCE</small>
           </div>
         </div>
 
         <div className="risk-result">
-          <span className={`risk-label ${high ? "danger-text" : "safe-text"}`}>
-            {high ? "⚠" : "✓"} {analysis.risk}
+          <span
+            className={`risk-label ${
+              hasResult ? (high ? "danger-text" : "safe-text") : ""
+            }`}
+          >
+            {hasResult ? (high ? "⚠" : "✓") : ""} {hasResult ? analysis.riskLevel : "NO SCAN YET"}
           </span>
 
           <p>
-            {high
+            {!hasResult
+              ? "Capture or upload a rock-face image to run an AI risk assessment."
+              : high
               ? "AI detected visual patterns associated with potential rockfall instability. Review the affected area."
               : "AI detected a visually stable rock-face pattern with low predicted rockfall risk."}
           </p>
@@ -828,28 +1254,20 @@ function RiskAssessment({ analysis }) {
           <div className="probability">
             <div>
               <span>HIGH RISK</span>
-              <strong>{analysis.high || 0}%</strong>
+              <strong>{analysis.high ?? 0}%</strong>
             </div>
             <div className="probability-track">
-              <span
-                style={{
-                  width: `${analysis.high || 0}%`,
-                }}
-              />
+              <span style={{ width: `${analysis.high ?? 0}%` }} />
             </div>
           </div>
 
           <div className="probability">
             <div>
               <span>LOW RISK</span>
-              <strong>{analysis.low || 0}%</strong>
+              <strong>{analysis.low ?? 0}%</strong>
             </div>
             <div className="probability-track low">
-              <span
-                style={{
-                  width: `${analysis.low || 0}%`,
-                }}
-              />
+              <span style={{ width: `${analysis.low ?? 0}%` }} />
             </div>
           </div>
         </div>
@@ -873,7 +1291,9 @@ function RiskAssessment({ analysis }) {
 
         <span>
           <small>STATUS</small>
-          <b className="safe-text">{analysis.status}</b>
+          <b className={analysis.status === "ERROR" ? "danger-text" : "safe-text"}>
+            {analysis.status}
+          </b>
         </span>
       </div>
     </section>
@@ -881,10 +1301,10 @@ function RiskAssessment({ analysis }) {
 }
 
 /* =========================================================
-   EXPLAINABILITY
+   EXPLAINABILITY (GRAD-CAM)
 ========================================================= */
 
-function Explainability({ imagePreview }) {
+function Explainability({ imagePreview, gradcamUrl, hasResult }) {
   return (
     <section className="panel explainability-panel">
       <PanelHeader
@@ -909,32 +1329,36 @@ function Explainability({ imagePreview }) {
         </div>
 
         <div>
-          <div className="visual-label">GRAD-CAM HEATMAP</div>
+          <div className="visual-label">GRAD-CAM / AI ATTENTION MAP</div>
 
           <div className="explain-image heatmap">
-            <div className="heatmap-grid" />
-            <div className="attention-zone zone-one" />
-            <div className="attention-zone zone-two" />
-            <div className="attention-zone zone-three" />
-            <div className="heatmap-center">
-              <Icon name="focus" />
-              AI ATTENTION
-            </div>
+            {gradcamUrl ? (
+              <img src={gradcamUrl} alt="Grad-CAM attention map" />
+            ) : (
+              <div className="visual-placeholder">
+                <Icon name="focus" />
+                {hasResult
+                  ? "Grad-CAM unavailable for this analysis."
+                  : "Awaiting analysis"}
+              </div>
+            )}
           </div>
         </div>
       </div>
 
-      <div className="attention-scale">
-        <span>LOW ATTENTION</span>
-        <div className="scale-bar">
-          <i />
-          <i />
-          <i />
-          <i />
-          <i />
+      {gradcamUrl && (
+        <div className="attention-scale">
+          <span>LOW ATTENTION</span>
+          <div className="scale-bar">
+            <i />
+            <i />
+            <i />
+            <i />
+            <i />
+          </div>
+          <span>HIGH ATTENTION</span>
         </div>
-        <span>HIGH ATTENTION</span>
-      </div>
+      )}
 
       <div className="ai-explanation">
         <div className="explanation-icon">
@@ -944,9 +1368,8 @@ function Explainability({ imagePreview }) {
         <div>
           <strong>AI VISUAL EXPLANATION</strong>
           <p>
-            The model focuses on regions of the rock face showing changes in
-            texture, discontinuity-like structures and fragmented surface
-            patterns. These visual signals contribute to the risk assessment.
+            Highlighted regions indicate image areas that contributed most
+            strongly to the AI prediction.
           </p>
         </div>
       </div>
@@ -955,49 +1378,62 @@ function Explainability({ imagePreview }) {
 }
 
 /* =========================================================
-   UPLOAD
+   CAPTURE / UPLOAD
 ========================================================= */
 
 function UploadPage({
-  role,
+  isAdmin,
+  sourceType,
+  setSourceType,
   sourceId,
   setSourceId,
   imagePreview,
   selectedImage,
   handleImage,
-  analyzeImage,
-  processing,
+  analysisState,
 }) {
-  const isAdmin = role === "administrator";
+  const busy = ["PROCESSING", "ANALYZING"].includes(analysisState);
 
   return (
     <>
       <PageHeader
-        eyebrow={isAdmin ? "UAV IMAGE INGESTION" : "MINE CAMERA INPUT"}
-        title={isAdmin ? "Drone Image Upload" : "Camera Image Upload"}
-        subtitle={
-          isAdmin
-            ? "Submit aerial rock-face imagery for AI risk assessment."
-            : "Submit mine-camera imagery for automated rockfall analysis."
-        }
+        eyebrow={isAdmin ? "UAV & CAMERA INGESTION" : "MINE CAMERA INPUT"}
+        title="Capture / Upload"
+        subtitle="Select an image and the AI pipeline runs automatically — no extra clicks needed."
       />
 
       <div className="upload-layout">
         <section className="panel upload-panel">
           <PanelHeader
-            title={isAdmin ? "DRONE IMAGE INPUT" : "MINE CAMERA INPUT"}
-            subtitle="Image acquisition and AI processing"
+            title="IMAGE INPUT"
+            subtitle="Image acquisition and automatic AI processing"
           />
 
           <div className="source-row">
+            {isAdmin && (
+              <div className="field">
+                <label>SOURCE TYPE</label>
+                <select
+                  value={sourceType}
+                  onChange={(e) => {
+                    setSourceType(e.target.value);
+                    setSourceId(e.target.value === "drone" ? "UAV-01" : "CAM-01");
+                  }}
+                >
+                  <option value="drone">Drone</option>
+                  <option value="camera">Camera</option>
+                </select>
+              </div>
+            )}
+
             <div className="field">
-              <label>{isAdmin ? "UAV ID" : "CAMERA ID"}</label>
+              <label>{isAdmin && sourceType === "drone" ? "UAV ID" : "CAMERA ID"}</label>
 
               <select
                 value={sourceId}
                 onChange={(e) => setSourceId(e.target.value)}
               >
-                {isAdmin ? (
+                {isAdmin && sourceType === "drone" ? (
                   <option>UAV-01</option>
                 ) : (
                   <>
@@ -1009,25 +1445,14 @@ function UploadPage({
                 )}
               </select>
             </div>
-
-            {!isAdmin && (
-              <div className="field">
-                <label>LOCATION</label>
-                <select>
-                  <option>North Highwall</option>
-                  <option>East Pit Wall</option>
-                  <option>South Ramp</option>
-                  <option>West Bench</option>
-                </select>
-              </div>
-            )}
           </div>
 
-          <label className="drop-zone">
+          <label className={`drop-zone ${busy ? "disabled" : ""}`}>
             <input
               type="file"
               accept="image/*"
               onChange={handleImage}
+              disabled={busy}
             />
 
             {imagePreview ? (
@@ -1053,49 +1478,36 @@ function UploadPage({
 
               <div>
                 <strong>{selectedImage.name}</strong>
-                <small>
-                  {(selectedImage.size / 1024 / 1024).toFixed(2)} MB
-                </small>
+                <small>{(selectedImage.size / 1024 / 1024).toFixed(2)} MB</small>
               </div>
 
               <span className="file-ready">
-                <span className="status-dot green" />
-                READY
+                <span className={`status-dot ${busy ? "orange" : "green"}`} />
+                {busy ? "PROCESSING" : "READY"}
               </span>
             </div>
           )}
 
           <div className="metadata-grid">
-            <Metadata label={isAdmin ? "UAV ID" : "CAMERA ID"} value={sourceId} />
+            <Metadata
+              label={isAdmin && sourceType === "drone" ? "UAV ID" : "CAMERA ID"}
+              value={sourceId}
+            />
             <Metadata label="TIMESTAMP" value="Automatic" />
             <Metadata label="AI MODEL" value={MODEL_NAME} />
             <Metadata label="PROCESSING" value={MODEL_DEVICE} />
           </div>
 
-          <button
-            className="analyze-button"
-            disabled={!selectedImage || processing}
-            onClick={analyzeImage}
-          >
-            {processing ? (
-              <>
-                <span className="spinner" />
-                PROCESSING IMAGE...
-              </>
-            ) : (
-              <>
-                <Icon name="brain" />
-                ANALYZE IMAGE
-                <Icon name="arrow" />
-              </>
-            )}
-          </button>
+          <p className="upload-hint">
+            Selecting an image automatically runs it through Risk Analysis and
+            Grad-CAM, then saves the result — there's nothing else to click.
+          </p>
         </section>
 
         <section className="panel process-panel">
           <PanelHeader
             title="PROCESSING PIPELINE"
-            subtitle="Capture → Analyze → Predict → Explain"
+            subtitle="Capture → Analyze → Predict → Explain → Save"
           />
 
           <PipelineStep
@@ -1103,17 +1515,19 @@ function UploadPage({
             icon="image"
             title="IMAGE RECEIVED"
             description="Rock-face image enters the AI pipeline."
-            active={Boolean(selectedImage)}
-            complete={Boolean(selectedImage)}
+            active={analysisState === "IMAGE_SELECTED"}
+            complete={
+              !["IDLE", "IMAGE_SELECTED"].includes(analysisState)
+            }
           />
 
           <PipelineStep
             number="02"
             icon="brain"
             title="AI ANALYSIS"
-            description="EfficientNet-B0 processes the image."
-            active={processing}
-            complete={!processing && Boolean(selectedImage)}
+            description="EfficientNet-B0 processes the image via FastAPI."
+            active={["PROCESSING", "ANALYZING"].includes(analysisState)}
+            complete={["RESULT", "GRAD_CAM", "SAVED"].includes(analysisState)}
           />
 
           <PipelineStep
@@ -1121,8 +1535,8 @@ function UploadPage({
             icon="target"
             title="RISK PREDICTION"
             description="Low Risk or High Risk classification."
-            active={false}
-            complete={false}
+            active={analysisState === "ANALYZING"}
+            complete={["RESULT", "GRAD_CAM", "SAVED"].includes(analysisState)}
           />
 
           <PipelineStep
@@ -1130,8 +1544,8 @@ function UploadPage({
             icon="focus"
             title="GRAD-CAM"
             description="Visual evidence and attention mapping."
-            active={false}
-            complete={false}
+            active={analysisState === "GRAD_CAM"}
+            complete={analysisState === "SAVED"}
           />
         </section>
       </div>
@@ -1140,10 +1554,20 @@ function UploadPage({
 }
 
 /* =========================================================
-   ANALYSIS PAGE
+   ANALYSIS PAGE (Risk Analysis + Grad-CAM + Final Result)
 ========================================================= */
 
-function AnalysisPage({ analysis, imagePreview, processing }) {
+function AnalysisPage({
+  analysis,
+  analysisState,
+  analysisError,
+  imagePreview,
+  retryAnalysis,
+  onNewScan,
+}) {
+  const hasResult = ["RESULT", "GRAD_CAM", "SAVED"].includes(analysisState);
+  const busy = ["PROCESSING", "ANALYZING"].includes(analysisState);
+
   return (
     <>
       <PageHeader
@@ -1152,17 +1576,63 @@ function AnalysisPage({ analysis, imagePreview, processing }) {
         subtitle="Explainable rockfall prediction powered by EfficientNet-B0."
       />
 
-      {processing && (
+      {busy && (
         <div className="processing-banner">
           <span className="spinner" />
           AI ENGINE PROCESSING ROCK-FACE IMAGE...
         </div>
       )}
 
+      {analysisState === "ERROR" && (
+        <div className="error-banner">
+          <Icon name="alert" />
+          <div>
+            <strong>AI ANALYSIS FAILED</strong>
+            <p>{analysisError || "Unable to connect to the Rockfall AI backend."}</p>
+          </div>
+          <button className="secondary-button" onClick={retryAnalysis}>
+            <Icon name="refresh" />
+            TRY AGAIN
+          </button>
+        </div>
+      )}
+
       <div className="analysis-layout">
         <RiskAssessment analysis={analysis} />
-        <Explainability imagePreview={imagePreview} />
+        <Explainability
+          imagePreview={imagePreview}
+          gradcamUrl={analysis.gradcamUrl}
+          hasResult={hasResult}
+        />
       </div>
+
+      {hasResult && (
+        <section className="panel final-result-panel">
+          <PanelHeader
+            title="FINAL RESULT"
+            subtitle="Complete analysis record"
+          />
+
+          <div className="metadata-grid">
+            <Metadata label="RISK LEVEL" value={analysis.riskLevel} />
+            <Metadata label="CONFIDENCE" value={`${analysis.confidence}%`} />
+            <Metadata label="LOW RISK PROBABILITY" value={`${analysis.low}%`} />
+            <Metadata label="HIGH RISK PROBABILITY" value={`${analysis.high}%`} />
+            <Metadata label="MODEL" value={analysis.model} />
+            <Metadata label="TIMESTAMP" value={analysis.timestamp} />
+            <Metadata label="SOURCE" value={`${analysis.source} • ${analysis.device}`} />
+            <Metadata
+              label="STATUS"
+              value={analysisState === "SAVED" ? "SAVED" : "COMPLETE"}
+            />
+          </div>
+
+          <button className="analyze-button" onClick={onNewScan}>
+            <Icon name="upload" />
+            NEW SCAN
+          </button>
+        </section>
+      )}
     </>
   );
 }
@@ -1171,7 +1641,17 @@ function AnalysisPage({ analysis, imagePreview, processing }) {
    HISTORY
 ========================================================= */
 
-function HistoryPage({ detections, search, setSearch }) {
+const HISTORY_FILTERS = ["All", "High Risk", "Low Risk", "Drone", "Camera"];
+
+function HistoryPage({
+  detections,
+  search,
+  setSearch,
+  historyFilter,
+  setHistoryFilter,
+  selectedDetection,
+  setSelectedDetection,
+}) {
   return (
     <>
       <PageHeader
@@ -1179,6 +1659,54 @@ function HistoryPage({ detections, search, setSearch }) {
         title="Detection History"
         subtitle="Search and review previous AI rockfall assessments."
       />
+
+      {selectedDetection && (
+        <section className="panel detection-detail-panel">
+          <PanelHeader
+            title={`DETECTION DETAIL • ${selectedDetection.device}`}
+            subtitle={selectedDetection.time}
+            action="CLOSE"
+            onAction={() => setSelectedDetection(null)}
+          />
+
+          <div className="explain-grid">
+            <div>
+              <div className="visual-label">ORIGINAL IMAGE</div>
+              <div className="explain-image">
+                {selectedDetection.imageUrl ? (
+                  <img src={selectedDetection.imageUrl} alt="Detection" />
+                ) : (
+                  <div className="visual-placeholder">
+                    <Icon name="image" />
+                    {selectedDetection.image}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <div className="visual-label">GRAD-CAM</div>
+              <div className="explain-image heatmap">
+                {selectedDetection.gradcamUrl ? (
+                  <img src={selectedDetection.gradcamUrl} alt="Grad-CAM" />
+                ) : (
+                  <div className="visual-placeholder">
+                    <Icon name="focus" />
+                    Grad-CAM unavailable for this analysis.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="metadata-grid">
+            <Metadata label="RISK" value={selectedDetection.risk} />
+            <Metadata label="CONFIDENCE" value={selectedDetection.confidence} />
+            <Metadata label="SOURCE" value={selectedDetection.source} />
+            <Metadata label="STATUS" value={selectedDetection.status} />
+          </div>
+        </section>
+      )}
 
       <section className="panel history-panel">
         <div className="history-toolbar">
@@ -1191,15 +1719,19 @@ function HistoryPage({ detections, search, setSearch }) {
             />
           </div>
 
-          <button className="secondary-button">
-            <Icon name="filter" />
-            FILTER
-          </button>
-
-          <button className="secondary-button">
-            <Icon name="download" />
-            EXPORT
-          </button>
+          <div className="filter-chip-row">
+            {HISTORY_FILTERS.map((filter) => (
+              <button
+                key={filter}
+                className={`secondary-button ${
+                  historyFilter === filter ? "active" : ""
+                }`}
+                onClick={() => setHistoryFilter(filter)}
+              >
+                {filter}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="table-wrapper">
@@ -1212,57 +1744,78 @@ function HistoryPage({ detections, search, setSearch }) {
                 <th>IMAGE</th>
                 <th>RISK</th>
                 <th>CONFIDENCE</th>
+                <th>MODEL</th>
                 <th>STATUS</th>
               </tr>
             </thead>
 
             <tbody>
-              {detections.map((item, index) => (
-                <tr key={`${item.time}-${index}`}>
-                  <td>{item.time}</td>
-
-                  <td>
-                    <span className="source-badge">
-                      <Icon name={item.source === "DRONE" ? "drone" : "camera"} />
-                      {item.source}
-                    </span>
-                  </td>
-
-                  <td>
-                    <strong>{item.device}</strong>
-                  </td>
-
-                  <td className="image-name">{item.image}</td>
-
-                  <td>
-                    <RiskBadge risk={item.risk} />
-                  </td>
-
-                  <td>
-                    <strong>{item.confidence}</strong>
-                  </td>
-
-                  <td>
-                    <span
-                      className={`table-status ${
-                        item.status === "Reviewed"
-                          ? "reviewed"
-                          : item.status === "Alert Active"
-                          ? "alert"
-                          : "review"
-                      }`}
-                    >
-                      {item.status}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+              {filteredDetectionsOrEmpty(detections)}
             </tbody>
           </table>
         </div>
       </section>
     </>
   );
+
+  function filteredDetectionsOrEmpty(rows) {
+    if (rows.length === 0) {
+      return (
+        <tr>
+          <td colSpan={8} className="empty-row">
+            No detections match this filter yet.
+          </td>
+        </tr>
+      );
+    }
+
+    return rows.map((item, index) => (
+      <tr
+        key={item.id ?? `${item.time}-${index}`}
+        className="clickable-row"
+        onClick={() => setSelectedDetection(item)}
+      >
+        <td>{item.time}</td>
+
+        <td>
+          <span className="source-badge">
+            <Icon name={item.source === "DRONE" ? "drone" : "camera"} />
+            {item.source}
+          </span>
+        </td>
+
+        <td>
+          <strong>{item.device}</strong>
+        </td>
+
+        <td className="image-name">{item.image}</td>
+
+        <td>
+          <RiskBadge risk={item.risk} />
+        </td>
+
+        <td>
+          <strong>{item.confidence}</strong>
+        </td>
+
+        <td>{MODEL_NAME}</td>
+
+        <td>
+          <span
+            className={`table-status ${
+              item.status === "Reviewed"
+                ? "reviewed"
+                : item.status === "Alert Active"
+                ? "alert"
+                : "review"
+            }`}
+          >
+            {item.status}
+          </span>
+        </td>
+      </tr>
+    ));
+  }
 }
 
 /* =========================================================
@@ -1368,7 +1921,7 @@ function CameraStatusPage() {
    ALERTS
 ========================================================= */
 
-function AlertsPage() {
+function AlertsPage({ alerts }) {
   return (
     <>
       <PageHeader
@@ -1378,34 +1931,28 @@ function AlertsPage() {
       />
 
       <div className="alert-stack">
-        <AlertCard
-          device="CAM-01"
-          location="North Highwall"
-          time="03:27:45"
-          confidence="91.7%"
-          probability="91.7%"
-        />
-
-        <AlertCard
-          device="UAV-01"
-          location="East Pit Wall"
-          time="03:54:12"
-          confidence="94.2%"
-          probability="94.2%"
-        />
-
-        <div className="safe-alert">
-          <div>
-            <Icon name="check" />
+        {alerts.length === 0 ? (
+          <div className="safe-alert">
+            <div>
+              <Icon name="check" />
+            </div>
+            <section>
+              <strong>✓ NO ACTIVE ALERTS</strong>
+              <p>No high-risk detections currently on record.</p>
+            </section>
           </div>
-          <section>
-            <strong>✓ LOW ROCKFALL RISK</strong>
-            <p>
-              No active high-risk alert currently detected by CAM-02.
-            </p>
-          </section>
-          <span>03:41:08</span>
-        </div>
+        ) : (
+          alerts.map((item) => (
+            <AlertCard
+              key={item.id}
+              device={item.device}
+              location={item.source}
+              time={item.time}
+              confidence={item.confidence}
+              probability={item.confidence}
+            />
+          ))
+        )}
       </div>
     </>
   );
@@ -1462,8 +2009,38 @@ function ReportsPage() {
     <>
       <PageHeader
         eyebrow="SYSTEM INTELLIGENCE"
-        title="Reports & Model Information"
-        subtitle="AI model performance and monitoring statistics."
+        title="Reports"
+        subtitle="Monitoring statistics and operational summaries."
+      />
+
+      <div className="report-grid">
+        <ReportMetric title="DATASET SIZE" value="2,764" subtitle="Images" />
+        <ReportMetric title="RISK CLASSES" value="2" subtitle="Low / High" />
+        <ReportMetric title="INPUT RESOLUTION" value={MODEL_INPUT} subtitle="Model input" />
+        <ReportMetric title="PROCESSING DEVICE" value={MODEL_DEVICE} subtitle="GPU acceleration" />
+        <ReportMetric title="EXPLAINABILITY" value="Grad-CAM" subtitle="Visual attention" />
+        <ReportMetric title="MODEL STATUS" value="READY" subtitle="Production engine" />
+      </div>
+
+      <section className="panel">
+        <PanelHeader title="MONITORING PIPELINE" subtitle="System architecture" />
+        <Workflow role="administrator" />
+      </section>
+    </>
+  );
+}
+
+/* =========================================================
+   MODEL INFORMATION
+========================================================= */
+
+function ModelInfoPage() {
+  return (
+    <>
+      <PageHeader
+        eyebrow="ARTIFICIAL INTELLIGENCE"
+        title="Model Information"
+        subtitle="Production AI model powering Rockfall AI."
       />
 
       <div className="report-hero">
@@ -1483,22 +2060,13 @@ function ReportsPage() {
       </div>
 
       <div className="report-grid">
-        <ReportMetric title="DATASET SIZE" value="2,764" subtitle="Images" />
-        <ReportMetric title="RISK CLASSES" value="2" subtitle="Low / High" />
-        <ReportMetric title="INPUT RESOLUTION" value="224 × 224" subtitle="RGB" />
-        <ReportMetric title="PROCESSING DEVICE" value="CUDA" subtitle="GPU acceleration" />
-        <ReportMetric title="EXPLAINABILITY" value="Grad-CAM" subtitle="Visual attention" />
-        <ReportMetric title="MODEL STATUS" value="READY" subtitle="Production engine" />
+        <ReportMetric title="MODEL" value={MODEL_NAME} subtitle="Architecture" />
+        <ReportMetric title="INPUT" value={MODEL_INPUT} subtitle="Preprocessing" />
+        <ReportMetric title="CLASSES" value={MODEL_CLASSES} subtitle={`${MODEL_CLASS_0} / ${MODEL_CLASS_1}`} />
+        <ReportMetric title="CLASS 0" value={MODEL_CLASS_0} subtitle="Label 0" />
+        <ReportMetric title="CLASS 1" value={MODEL_CLASS_1} subtitle="Label 1" />
+        <ReportMetric title="DEVICE" value={MODEL_DEVICE} subtitle="Inference hardware" />
       </div>
-
-      <section className="panel">
-        <PanelHeader
-          title="MONITORING PIPELINE"
-          subtitle="System architecture"
-        />
-
-        <Workflow role="administrator" />
-      </section>
     </>
   );
 }
@@ -1521,9 +2089,9 @@ function SettingsPage() {
           title="AI ENGINE"
           icon="brain"
           rows={[
-            ["Model", "EfficientNet-B0"],
-            ["Input", "224 × 224"],
-            ["Device", "CUDA"],
+            ["Model", MODEL_NAME],
+            ["Input", MODEL_INPUT],
+            ["Device", MODEL_DEVICE],
             ["Explainability", "Grad-CAM"],
           ]}
         />
@@ -1549,6 +2117,16 @@ function SettingsPage() {
             ["Connection", "Secure"],
           ]}
         />
+
+        <SettingsCard
+          title="SUPABASE"
+          icon="server"
+          rows={[
+            ["Configured", supabase ? "YES" : "NO"],
+            ["Detections table", DETECTIONS_TABLE],
+            ["Image bucket", IMAGE_BUCKET],
+          ]}
+        />
       </div>
     </>
   );
@@ -1571,7 +2149,7 @@ function HelpPage() {
         <HelpCard
           icon="upload"
           title="IMAGE ANALYSIS"
-          text="Upload a rock-face image, select the monitoring source and press Analyze Image to run the AI model."
+          text="Select a rock-face image on the Capture / Upload page. The AI pipeline (risk analysis, Grad-CAM, save) runs automatically — no extra clicks required."
         />
 
         <HelpCard
@@ -1583,7 +2161,7 @@ function HelpPage() {
         <HelpCard
           icon="focus"
           title="GRAD-CAM"
-          text="Grad-CAM highlights image regions that contributed strongly to the model's prediction."
+          text="Highlighted regions indicate image areas that contributed most strongly to the AI prediction."
         />
 
         <HelpCard
@@ -1636,7 +2214,7 @@ function LiveFeed({ title, subtitle, type }) {
             </span>
           </div>
 
-          <div className="feed-corner top-left">REC • 04:08:24</div>
+          <div className="feed-corner top-left">REC • {nowTime()}</div>
           <div className="feed-corner top-right">AI MONITORING ACTIVE</div>
           <div className="feed-corner bottom-left">1920 × 1080</div>
           <div className="feed-corner bottom-right">SIGNAL STRONG</div>
@@ -1655,7 +2233,7 @@ function Workflow({ role }) {
 
   const steps = isAdmin
     ? [
-        ["UAV", "drone"],
+        ["UAV / CAMERA", "drone"],
         ["IMAGE CAPTURE", "image"],
         ["AI ANALYSIS", "brain"],
         ["RISK PREDICTION", "target"],
@@ -1677,7 +2255,7 @@ function Workflow({ role }) {
         title="SYSTEM WORKFLOW"
         subtitle={
           isAdmin
-            ? "UAV → Image → AI → Prediction → Explain → Dashboard"
+            ? "UAV/Camera → Image → AI → Prediction → Explain → Dashboard"
             : "Camera → Image → AI → Prediction → Explain → Alert"
         }
       />
@@ -1705,7 +2283,7 @@ function Workflow({ role }) {
 }
 
 /* =========================================================
-   COMPONENTS
+   SHARED COMPONENTS
 ========================================================= */
 
 function PageHeader({ eyebrow, title, subtitle }) {
@@ -1720,11 +2298,7 @@ function PageHeader({ eyebrow, title, subtitle }) {
       <div className="header-time">
         <span className="status-dot green" />
         SYSTEM TIME
-        <strong>
-          {new Date().toLocaleTimeString("en-IN", {
-            hour12: false,
-          })}
-        </strong>
+        <strong>{nowTime()}</strong>
       </div>
     </div>
   );
@@ -1775,10 +2349,18 @@ function StatCard({ title, value, icon, state = "", footer }) {
 }
 
 function DetectionList({ detections }) {
+  if (detections.length === 0) {
+    return (
+      <div className="empty-row" style={{ padding: "16px 0" }}>
+        No detections yet — run a scan to populate this list.
+      </div>
+    );
+  }
+
   return (
     <div className="detection-list">
       {detections.map((item, index) => (
-        <div className="detection-row" key={`${item.time}-${index}`}>
+        <div className="detection-row" key={item.id ?? `${item.time}-${index}`}>
           <div className="detection-time">{item.time}</div>
 
           <div className="detection-source">
@@ -1816,7 +2398,7 @@ function Metadata({ label, value }) {
   return (
     <div className="metadata">
       <small>{label}</small>
-      <strong>{value}</strong>
+      <strong>{value ?? "—"}</strong>
     </div>
   );
 }
@@ -1848,9 +2430,9 @@ function DeviceRows({ rows }) {
           <span>{label}</span>
           <strong
             className={
-              ["ONLINE", "READY", "ACTIVE", "Strong"].includes(value)
+              ["ONLINE", "READY", "ACTIVE", "Strong", "YES"].includes(value)
                 ? "safe-text"
-                : value === "OFFLINE"
+                : ["OFFLINE", "NO"].includes(value)
                 ? "danger-text"
                 : ""
             }
